@@ -5,7 +5,8 @@
 仅依赖标准库（urllib），无需安装第三方包。
 流程：登记→上报→幂等→冲突→缺号→更正→处置依赖（建立/幂等/校验/查询）→
 封存被拒→闭合→封存（含依赖快照）→封存后迟到与依赖增删→完成被拒→闭合→完成→
-完成后拒绝语义（含依赖变更）→重复完成幂等。
+完成后拒绝语义（含依赖变更）→重复完成幂等→
+冲突证据裁决（维持/采纳、乐观修订号、幂等/改判拒绝、裁决后封存）。
 
 用法：
     python3 examples/demo_api.py
@@ -266,6 +267,67 @@ def main() -> None:
          call("GET", f"/api/drills/{drill_id}/seals/2"))
     show("历史时间线仍可读", call("GET", f"/api/drills/{drill_id}/timeline"))
     show("依赖查询仍可用", call("GET", f"/api/drills/{drill_id}/records/T1/3/dependencies"))
+
+    # 17. 冲突证据裁决（独立演练）：维持 / 乐观修订号 / 采纳为下一修订 / 幂等 / 改判拒绝
+    step("17. 冲突证据裁决：维持现记录 / 采纳迟到原文")
+    adj_drill = show("建裁决演练+J", call("POST", "/api/drills",
+                                          {"name": "裁决演示", "terminals": ["J"]}))["id"]
+    aurl = f"/api/drills/{adj_drill}/terminals/J/reports"
+    show("J 上报 1,2", call("POST", aurl, {"entries": [
+        {"seq": 1, "occurred_at": "2026-10-06T08:00:00Z",
+         "event_type": "water_level", "content": "水位 21.4m"},
+        {"seq": 2, "occurred_at": "2026-10-06T08:05:00Z",
+         "event_type": "patrol", "content": "巡查正常"},
+    ]}))
+    c1 = show("冲突 J#1", call("POST", aurl, {"entries": [
+        {"seq": 1, "occurred_at": "2026-10-06T08:00:00Z",
+         "event_type": "water_level", "content": "水位 21.4m（迟到原文：已复核）"},
+    ]}))["results"][0]["conflict_id"]
+    c2 = show("冲突 J#2", call("POST", aurl, {"entries": [
+        {"seq": 2, "occurred_at": "2026-10-06T08:05:00Z",
+         "event_type": "patrol", "content": "巡查发现渗漏（迟到原文）"},
+    ]}))["results"][0]["conflict_id"]
+    show("冲突列表（adjudication 未裁决为 null）",
+         call("GET", f"/api/drills/{adj_drill}/conflicts"))
+
+    show("C1 维持现记录（201）", call(
+        "POST", f"/api/drills/{adj_drill}/conflicts/{c1}/adjudications",
+        {"decision": "keep_current",
+         "reason": "现记录为现场指挥确认版本，迟到报文未签章",
+         "decided_by": "演练负责人"}))
+    show("C1 相同结论+相同理由重试 => 200 原裁决", call(
+        "POST", f"/api/drills/{adj_drill}/conflicts/{c1}/adjudications",
+        {"decision": "keep_current",
+         "reason": "现记录为现场指挥确认版本，迟到报文未签章",
+         "decided_by": "另一个人"}))
+    show("C1 改判 => 409 conflict_already_adjudicated", call(
+        "POST", f"/api/drills/{adj_drill}/conflicts/{c1}/adjudications",
+        {"decision": "adopt_incoming", "reason": "改判",
+         "decided_by": "演练负责人", "expected_rev": 0}))
+
+    show("C2 采纳但缺少 expected_rev => 400", call(
+        "POST", f"/api/drills/{adj_drill}/conflicts/{c2}/adjudications",
+        {"decision": "adopt_incoming", "reason": "迟到终端数据可信",
+         "decided_by": "演练负责人"}))
+    show("期间 C2 被人工更正为 rev=1", call(
+        "PUT", f"/api/drills/{adj_drill}/records/J/2",
+        {"content": "巡查正常（人工二次确认）", "reason": "值班长二次校核",
+         "revised_by": "值班长"}))
+    show("带旧修订号 0 采纳 => 409 revision_conflict，不落裁决", call(
+        "POST", f"/api/drills/{adj_drill}/conflicts/{c2}/adjudications",
+        {"decision": "adopt_incoming", "reason": "迟到终端数据可信",
+         "decided_by": "演练负责人", "expected_rev": 0}))
+    show("带当前修订号 1 采纳 => 201：迟到原文写为 rev=2，原文/历史保留", call(
+        "POST", f"/api/drills/{adj_drill}/conflicts/{c2}/adjudications",
+        {"decision": "adopt_incoming", "reason": "与现场再次核对后采纳迟到原文",
+         "decided_by": "演练负责人", "expected_rev": 1}))
+    show("单证据查询（含裁决）",
+         call("GET", f"/api/drills/{adj_drill}/conflicts/{c2}"))
+    show("跨演练裁决 => 404 cross_drill_conflict", call(
+        "POST", f"/api/drills/{drill_id}/conflicts/{c2}/adjudications",
+        {"decision": "keep_current", "reason": "跨演练", "decided_by": "x"}))
+    show("裁决后封存：新版本包含采纳修订与完整历史", call(
+        "POST", f"/api/drills/{adj_drill}/seals", {"note": "裁决后封存"}))
 
 
 if __name__ == "__main__":

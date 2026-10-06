@@ -168,4 +168,70 @@ curl -s "$BASE/api/drills/$DID/seals/2"; echo
 curl -s "$BASE/api/drills/$DID/timeline"; echo
 curl -s "$BASE/api/drills/$DID/records/T1/3/dependencies"; echo
 
+echo "## 17. 冲突裁决（独立演练：维持 / 乐观修订号 / 采纳为下一修订 / 幂等 / 改判拒绝）"
+ADID=$(curl -s -X POST "$BASE/api/drills" -H "$ctype" \
+  -d '{"name":"裁决演示","terminals":["J"]}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+AURL="$BASE/api/drills/$ADID/terminals/J/reports"
+curl -s -X POST "$AURL" -H "$ctype" -d '{
+  "entries": [
+    {"seq": 1, "occurred_at": "2026-10-06T08:00:00Z", "event_type": "water_level", "content": "水位 21.4m"},
+    {"seq": 2, "occurred_at": "2026-10-06T08:05:00Z", "event_type": "patrol", "content": "巡查正常"}
+  ]
+}'; echo
+# 两条迟到内容不同 => 两份冲突证据
+C1=$(curl -s -X POST "$AURL" -H "$ctype" -d '{
+  "entries": [{"seq": 1, "occurred_at": "2026-10-06T08:00:00Z", "event_type": "water_level", "content": "水位 21.4m（迟到原文：已复核）"}]
+}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["results"][0]["conflict_id"])')
+C2=$(curl -s -X POST "$AURL" -H "$ctype" -d '{
+  "entries": [{"seq": 2, "occurred_at": "2026-10-06T08:05:00Z", "event_type": "patrol", "content": "巡查发现渗漏（迟到原文）"}]
+}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["results"][0]["conflict_id"])')
+echo "conflict C1=$C1 C2=$C2"
+echo "-- 冲突列表（含 adjudication 裁决字段，未裁决为 null）"
+curl -s "$BASE/api/drills/$ADID/conflicts"; echo
+echo "-- C1 维持现记录（201）"
+curl -s -X POST "$BASE/api/drills/$ADID/conflicts/$C1/adjudications" -H "$ctype" -d '{
+  "decision": "keep_current",
+  "reason": "现记录为现场指挥确认版本，迟到报文未签章",
+  "decided_by": "演练负责人"
+}'; echo
+echo "-- C1 相同结论+相同理由重试 => 200 原裁决（already_adjudicated: true）"
+curl -s -X POST "$BASE/api/drills/$ADID/conflicts/$C1/adjudications" -H "$ctype" -d '{
+  "decision": "keep_current",
+  "reason": "现记录为现场指挥确认版本，迟到报文未签章",
+  "decided_by": "另一个人"
+}'; echo
+echo "-- C1 改判/改理由 => 409 conflict_already_adjudicated"
+curl -s -X POST "$BASE/api/drills/$ADID/conflicts/$C1/adjudications" -H "$ctype" -d '{
+  "decision": "adopt_incoming", "reason": "改判", "decided_by": "演练负责人",
+  "expected_rev": 0
+}'; echo
+echo "-- C2 采纳但不传 expected_rev => 400 invalid_expected_rev"
+curl -s -X POST "$BASE/api/drills/$ADID/conflicts/$C2/adjudications" -H "$ctype" -d '{
+  "decision": "adopt_incoming", "reason": "迟到终端数据可信", "decided_by": "演练负责人"
+}'; echo
+echo "-- 期间 C2 被人工更正为 rev=1"
+curl -s -X PUT "$BASE/api/drills/$ADID/records/J/2" -H "$ctype" -d '{
+  "content": "巡查正常（人工二次确认）", "reason": "值班长二次校核", "revised_by": "值班长"
+}'; echo
+echo "-- 带旧修订号 expected_rev=0 采纳 => 409 revision_conflict，不落裁决"
+curl -s -X POST "$BASE/api/drills/$ADID/conflicts/$C2/adjudications" -H "$ctype" -d '{
+  "decision": "adopt_incoming", "reason": "迟到终端数据可信", "decided_by": "演练负责人",
+  "expected_rev": 0
+}'; echo
+echo "-- 带当前修订号 expected_rev=1 采纳 => 201，迟到原文写为 rev=2，原文/历史保留"
+curl -s -X POST "$BASE/api/drills/$ADID/conflicts/$C2/adjudications" -H "$ctype" -d '{
+  "decision": "adopt_incoming",
+  "reason": "与现场再次核对后采纳迟到原文",
+  "decided_by": "演练负责人",
+  "expected_rev": 1
+}'; echo
+echo "-- 单证据查询（含裁决）"
+curl -s "$BASE/api/drills/$ADID/conflicts/$C2"; echo
+echo "-- 跨演练拿证据裁决 => 404 cross_drill_conflict"
+curl -s -X POST "$BASE/api/drills/$DID/conflicts/$C2/adjudications" -H "$ctype" -d '{
+  "decision": "keep_current", "reason": "跨演练", "decided_by": "x"
+}'; echo
+echo "-- 封存：既有版本不受裁决影响；裁决演示演练无缺号，封存后版本含采纳修订"
+curl -s -X POST "$BASE/api/drills/$ADID/seals" -H "$ctype" -d '{"note":"裁决后封存"}'; echo
+
 echo "DONE drill_id=$DID"

@@ -10,6 +10,7 @@ from . import service
 from .db import connect, init_db
 from .errors import APIError
 from .models import (
+    ConflictDecision,
     Correction,
     DependencyCreate,
     DependencyRevoke,
@@ -121,6 +122,30 @@ def mark_lost(drill_id: str, terminal_code: str, payload: MarkLost,
 @app.get("/api/drills/{drill_id}/conflicts")
 def conflicts(drill_id: str, conn=Depends(db)) -> dict:
     return service.list_conflicts(conn, drill_id)
+
+
+# ---------------------------------------------------------------- 冲突裁决
+
+@app.get("/api/drills/{drill_id}/conflicts/{conflict_id}")
+def get_conflict(drill_id: str, conflict_id: str, conn=Depends(db)) -> dict:
+    """单条冲突证据及其裁决（仅限本演练证据）。"""
+    return service.get_conflict(conn, drill_id, conflict_id)
+
+
+@app.post("/api/drills/{drill_id}/conflicts/{conflict_id}/adjudications")
+def adjudicate_conflict(drill_id: str, conflict_id: str, payload: ConflictDecision,
+                        response: Response, conn=Depends(db)) -> dict:
+    """演练负责人对冲突证据逐条裁决：维持现记录 / 采纳迟到原文。
+
+    首次裁决返回 201；同一证据以相同结论和理由重试幂等返回 200 与原裁决；
+    改判或改理由返回 409。采纳须提交 expected_rev，期间记录被更正返回 409 且不落裁决。
+    """
+    result = service.adjudicate_conflict(
+        conn, drill_id, conflict_id, payload.model_dump(exclude_none=False)
+    )
+    if not result["already_adjudicated"]:
+        response.status_code = 201
+    return result
 
 
 # ---------------------------------------------------------------- 记录 / 更正

@@ -168,6 +168,26 @@ SCHEMA_STATEMENTS = [
         UNIQUE (pred_record_id, succ_record_id)
     )
     """,
+    # 冲突裁决：演练负责人对每份冲突证据给出“维持现记录/采纳迟到原文”的首次裁决。
+    # decision 为 keep_current / adopt_incoming；裁决不可更改：同结论同理由重试幂等，
+    # 改判或改理由拒绝。expected_rev 为采纳时提交方所见的当前修订号（乐观并发）。
+    # applied_rev 为采纳生效后记录的修订号；迟到原文与当前一致时不产生空修订（applied_rev 即当前 rev）。
+    """
+    CREATE TABLE IF NOT EXISTS conflict_adjudications (
+        id                 TEXT PRIMARY KEY,
+        conflict_id        TEXT NOT NULL UNIQUE REFERENCES conflicts(id),
+        drill_id           TEXT NOT NULL REFERENCES drills(id),
+        decision           TEXT NOT NULL CHECK (decision IN ('keep_current', 'adopt_incoming')),
+        reason             TEXT NOT NULL,
+        decided_by         TEXT NOT NULL,
+        expected_rev       INTEGER,
+        current_rev_before INTEGER NOT NULL,
+        applied_rev        INTEGER NOT NULL,
+        revision_created   INTEGER NOT NULL DEFAULT 0,
+        revision_id        TEXT REFERENCES record_revisions(id),
+        created_at         TEXT NOT NULL
+    )
+    """,
     # 封存时点的依赖快照（append-only，含当时依据）
     """
     CREATE TABLE IF NOT EXISTS seal_dependencies (
@@ -187,6 +207,7 @@ SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_conflicts_drill ON conflicts(drill_id)",
     "CREATE INDEX IF NOT EXISTS idx_lost_drill ON lost_gaps(drill_id, resolved)",
     "CREATE INDEX IF NOT EXISTS idx_deps_drill ON record_dependencies(drill_id)",
+    "CREATE INDEX IF NOT EXISTS idx_adjudications_drill ON conflict_adjudications(drill_id)",
 ]
 
 

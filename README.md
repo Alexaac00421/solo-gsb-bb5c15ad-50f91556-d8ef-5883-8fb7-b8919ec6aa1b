@@ -7,6 +7,8 @@
 缺号全部闭合时原子生成**最终封存版本**并将演练转为已完成，此后拒绝一切变更。
 现场指挥还可在同一演练内把已上报记录标记为**处置依赖**（前置 → 后续，附非空依据），
 支持幂等建立/撤销、防环校验与单记录依赖链查询；依赖随封存版本一并固化。
+演练负责人可对上报产生的**冲突证据逐条裁决**：维持现记录或采纳迟到原文，
+采纳基于**乐观修订号**防止用旧内容覆盖期间的更正，裁决与修订原子生效。
 
 - 技术栈：Python 3.11 · FastAPI · SQLite（标准库 `sqlite3`，WAL + 写事务串行化）
 - 无外部服务依赖，Docker 一条命令启动，数据持久化在命名卷中
@@ -94,6 +96,26 @@ compose 中将宿主机 `8080` 映射到容器 `8080`，如需换端口改
     （含深度 `depth`），均按**终端标识 + 序号**稳定排序；
   - **更正不改变依赖所指身份**：依赖按记录身份（record_id）固化，内容修订不影响依赖；
   - 未完成演练可撤销依赖；**完成后拒绝依赖变更**（`409 drill_completed`），查询照常。
+- **冲突裁决**（演练负责人对冲突证据逐条裁决，仅限本演练证据）：
+  - 提交 `decision`（`keep_current` 维持现记录 / `adopt_incoming` 采纳迟到原文）、
+    **非空理由** `reason` 与**操作者** `decided_by`；
+  - **首次裁决 201**；演练**完成后不得首次裁决**（`409 drill_completed`）；
+  - **幂等与不可改判**：同一证据以**相同结论 + 相同理由**重试返回原裁决
+    （`200`，`already_adjudicated: true`，含原操作者）；**改判或改理由一律拒绝**
+    （`409 conflict_already_adjudicated`，返回体带原裁决），原裁决与记录均不变；
+  - **乐观修订号（仅采纳）**：采纳必须提交所见的当前修订号 `expected_rev`；
+    若期间记录已被更正（当前 `rev` 不等于 `expected_rev`），返回
+    `409 revision_conflict`（`details` 同时给出两个修订号），**不落裁决、不写修订**，
+    不能用证据里的旧内容覆盖新版本；负责人重新核对当前内容后可用新修订号再次裁决；
+  - **采纳效果**：证据所存迟到原文写为该记录的**下一修订**（`rev+1`），
+    **原文（`rev=0`）与历史修订全部保留**；裁决行与修订插入、当前记录更新在
+    **同一事务内原子生效**。若采纳时迟到原文**已与当前内容一致**（例如期间被人工
+    更正成同一内容），**只记裁决、不产生空修订**（`revision_created: false`）；
+  - **维持现记录**：只记裁决，记录不做任何变更；
+  - **与封存的关系**：裁决不触碰任何既有封存版本（快照表 append-only）；
+    裁决后的**后续封存**包含修订结果与当时的全部修订历史；
+  - **查询**：冲突列表中每条证据带 `adjudication` 字段（未裁决为 `null`），
+    也可按冲突 ID 取单条证据及其裁决。
 - **封存**：
   - 条件——所有终端的缺号要么已补齐、要么已逐号确认丢失，否则 `409 unresolved_gaps` 并返回未闭合清单；
   - 封存生成**只追加（append-only）的不可变快照版本**：封存时刻的时间线、每条记录的全部修订原文、
@@ -131,7 +153,9 @@ compose 中将宿主机 `8080` 映射到容器 `8080`，如需换端口改
 | GET | `/api/drills/{drill_id}/timeline` | 当前时间线 + 显式缺号 |
 | GET | `/api/drills/{drill_id}/gaps` | 缺号清单（未闭合 / 已确认丢失） |
 | POST | `/api/drills/{drill_id}/terminals/{terminal_code}/gaps/lost` | 逐号确认缺号丢失（幂等） |
-| GET | `/api/drills/{drill_id}/conflicts` | 冲突证据列表 |
+| GET | `/api/drills/{drill_id}/conflicts` | 冲突证据列表（每条含 `adjudication` 裁决字段） |
+| GET | `/api/drills/{drill_id}/conflicts/{conflict_id}` | 单条冲突证据及其裁决（仅限本演练证据） |
+| POST | `/api/drills/{drill_id}/conflicts/{conflict_id}/adjudications` | **冲突裁决**：维持现记录 / 采纳迟到原文（首次 201，同结论同理由重试 200） |
 | GET | `/api/drills/{drill_id}/records/{terminal_code}/{seq}` | 单条记录 + 全部修订 |
 | PUT | `/api/drills/{drill_id}/records/{terminal_code}/{seq}` | **附理由更正** |
 | POST | `/api/drills/{drill_id}/dependencies` | **建立处置依赖**（前置→后续+非空依据，幂等） |
@@ -213,6 +237,57 @@ compose 中将宿主机 `8080` 映射到容器 `8080`，如需换端口改
 `predecessors`/`successors` 为直接前置/后续（含依据），`predecessor_chain` 为沿前置方向
 展开的完整链（`depth` 为最小跳数），三者均按终端标识 + 序号稳定排序。
 
+**冲突裁决** `POST /api/drills/{id}/conflicts/{conflict_id}/adjudications`
+
+维持现记录：
+
+```json
+{"decision": "keep_current",
+ "reason": "现记录为现场指挥确认版本，迟到报文未签章",
+ "decided_by": "演练负责人"}
+```
+
+采纳迟到原文（必须带所见当前修订号；冲突证据可在 `GET .../conflicts` 中连同
+记录当前 `rev` 一起取得）：
+
+```json
+{"decision": "adopt_incoming",
+ "reason": "与现场再次核对后采纳迟到原文",
+ "decided_by": "演练负责人",
+ "expected_rev": 1}
+```
+
+首次裁决返回 `201`：
+
+```json
+{
+  "drill_id": "drill_...",
+  "already_adjudicated": false,
+  "conflict": {"id": "cfl_...", "terminal_code": "T1", "seq": 2, "incoming": "...",
+               "existing": "...", "incoming_fingerprint": "...", "existing_fingerprint": "..."},
+  "adjudication": {
+    "id": "adj_...", "conflict_id": "cfl_...",
+    "decision": "adopt_incoming", "decision_label": "采纳迟到原文",
+    "reason": "与现场再次核对后采纳迟到原文", "decided_by": "演练负责人",
+    "expected_rev": 1, "current_rev_before": 1, "applied_rev": 2,
+    "revision_created": true, "revision_id": "rev_...",
+    "created_at": "2026-10-06T09:00:00.000000+00:00"
+  },
+  "record": {"terminal_code": "T1", "seq": 2, "content": "巡查发现渗漏（迟到原文）", "rev": 2,
+             "revisions": [{"rev": 0, "content": "巡查正常", "is_original": true},
+                           {"rev": 1, "content": "巡查正常（人工二次确认）"},
+                           {"rev": 2, "content": "巡查发现渗漏（迟到原文）"}]},
+  "note": "采纳迟到原文已写为下一修订；原文与历次修订保留；既有封存版本不变"
+}
+```
+
+- 迟到原文已与当前内容一致时：`revision_created: false`、`applied_rev == current_rev_before`，
+  只记裁决，不产生空修订；
+- 相同结论 + 相同理由重试：`200` 且 `already_adjudicated: true`，返回**同一裁决**
+  （原 `decided_by` 等）；改判或改理由：`409 conflict_already_adjudicated`；
+- 期间记录被更正导致 `expected_rev` 过期：`409 revision_conflict`
+  （`details.expected_rev` / `details.current_rev`），不落裁决。
+
 **封存** `POST /api/drills/{id}/seals`：成功返回版本快照（`version`、`records` 含各自全部
 `revisions`、`closed_gaps` 含 `filled`/`lost` 闭合证据、`dependencies` 含当时的处置依赖及依据，
 `immutable: true`）。
@@ -253,6 +328,12 @@ compose 中将宿主机 `8080` 映射到容器 `8080`，如需换端口改
 | 发生时间无法解析（条目级） | 200 体 `rejected` | `invalid_occurred_at` |
 | 类型/内容为空（条目级） | 200 体 `rejected` | `invalid_event_type` / `invalid_content` |
 | 同序号内容冲突 | 200 体 `conflict` | 冲突证据落库 `conflicts` |
+| 冲突证据不存在 / 不在本演练 | 404 | `conflict_not_found` / `cross_drill_conflict` |
+| 裁决结论非法 | 400 | `invalid_decision` |
+| 裁决理由 / 操作者为空 | 400 | `invalid_reason` / `invalid_decided_by` |
+| 采纳缺少或非法的 `expected_rev` | 400 | `invalid_expected_rev` |
+| 对已裁决证据改判或改理由 | 409 | `conflict_already_adjudicated`（details 带原裁决） |
+| 采纳时记录期间已被更正（修订号过期） | 409 | `revision_conflict`（details 带 expected/current 修订号，不落裁决） |
 | 跨演练更正（记录不在该演练） | 404 | `record_not_found`（终端层面先报 `cross_drill_terminal`） |
 | 更正无理由 / 无变化 | 400 | `invalid_reason` / `no_change` |
 | 依赖依据为空 | 400 | `invalid_reason` |
@@ -269,7 +350,8 @@ compose 中将宿主机 `8080` 映射到容器 `8080`，如需换端口改
 ## 6. 调用示例
 
 - 纯标准库 Python，全流程（登记→上报→幂等→冲突→缺号→更正→处置依赖→封存被拒→闭合→
-  封存→封存后迟到与依赖增删→完成被拒→闭合→完成→完成后拒绝语义→重复完成幂等）：
+  封存→封存后迟到与依赖增删→完成被拒→闭合→完成→完成后拒绝语义→重复完成幂等→
+  **冲突裁决：维持/采纳、乐观修订号冲突、幂等/改判拒绝、裁决后封存**）：
 
   ```bash
   pip install httpx   # 仅测试需要；demo_api.py 只用标准库
@@ -301,9 +383,15 @@ python -m pytest -q
 直接与间接成环拒绝及撤销后重建、单记录直接前置/后续与前置完整链的稳定排序、
 更正后依赖身份不变、封存快照固化依赖且后续增删不影响历史版本、
 完成时依赖随最终版本原子固化、完成后依赖变更被拒而查询照常；
+冲突裁决——维持不改记录、采纳写为下一修订且原文/历史保留、
+迟到原文已与当前一致时不产生空修订、`expected_rev` 过期返回 `revision_conflict`
+且不落裁决不覆盖新版本、同结论同理由重试返回原裁决、改判/改理由拒绝、
+空理由/空操作者/非法结论/缺少修订号校验、证据按演练隔离（`cross_drill_conflict`）、
+完成后不得首次裁决而原裁决仍可幂等重试、既有封存版本不变而后续封存含裁决修订；
 以及 20 线程并发下**同序号相同内容恰有 1 条 accepted/19 条 duplicate**、
 **不同内容恰有 1 条 accepted/19 份冲突证据**、**并发完成恰好生成 1 个最终版本**、
-**并发建立同一依赖恰有 1 条新建/其余幂等命中**。
+**并发建立同一依赖恰有 1 条新建/其余幂等命中**、
+**并发裁决同一证据恰有 1 次首次裁决/其余幂等返回且只产生 1 个修订**。
 
 ## 8. 并发与数据完整性设计
 
@@ -312,13 +400,19 @@ python -m pytest -q
   状态翻转”在同一事务内原子生效，并发完成恰好生成一个最终版本。
 - 唯一约束兜底：`terminals(drill_id, code)`、`records(terminal_id, seq)`、
   `lost_gaps(terminal_id, seq)`、`seals(drill_id, version)`、
-  `record_dependencies(pred_record_id, succ_record_id)`。
+  `record_dependencies(pred_record_id, succ_record_id)`、
+  `conflict_adjudications(conflict_id)`（每份冲突证据至多一条裁决）。
 - 封存数据写入 `seals / seal_records / seal_revisions / seal_gaps / seal_dependencies`
   独立快照表，仅追加；服务不提供任何更新/删除快照的代码路径，
   迟到上报、更正与依赖增删只作用于当前时间线表。
 - 处置依赖的环检测与建立在同一 `BEGIN IMMEDIATE` 事务内完成：先沿前置方向做 BFS
   确认“后续记录”不在“前置记录”的祖先集合中再插边，并发提交被写锁串行化，
   不会写出成环或重复的依赖。
+- 冲突裁决同样在单条 `BEGIN IMMEDIATE` 事务内完成“查证据 → 查既有裁决 → 乐观修订号比对 →
+  写下一修订（采纳时）→ 写裁决”：并发裁决同一证据被串行化，恰有一次首次裁决；
+  重试请求看到既有裁决后按“同结论同理由”判定幂等返回，裁决与修订要么同时可见要么都不落。
+  裁决只写当前视图的 `records / record_revisions` 与只追加的 `conflict_adjudications`，
+  代码路径不更新任何 `seal_*` 快照表，既有封存版本不可能被改写。
 - 演练完成后（`drills.status = completed`）所有变更入口在事务内先行拒绝；
   最终封存版本号固化在 `drills.final_seal_version`，重复完成直接读取并返回同一版本。
 - 时间统一规范化为 UTC ISO-8601（微秒精度），既保证幂等指纹稳定，也保证字符串排序即时间排序。

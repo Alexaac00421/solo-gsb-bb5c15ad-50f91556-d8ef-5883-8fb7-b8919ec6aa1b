@@ -80,3 +80,14 @@ class DependencyCreate(BaseModel):
 class DependencyRevoke(BaseModel):
     predecessor: DependencyEndpoint
     successor: DependencyEndpoint
+
+
+class ConflictDecision(BaseModel):
+    # 裁决结论：keep_current（维持现记录）/ adopt_incoming（采纳迟到原文）
+    decision: Any = None
+    # 非空裁决理由（重试用同样的理由才幂等）
+    reason: Any = None
+    # 操作者（演练负责人）
+    decided_by: Any = None
+    # 采纳时必须提交所见的当前修订号；期间记录被更正则乐观冲突，不落裁决
+    expected_rev: Any = None

@@ -4,8 +4,9 @@
 默认访问 http://127.0.0.1:8080，可用环境变量 BASE_URL 覆盖。
 仅依赖标准库（urllib），无需安装第三方包。
 流程：登记→上报→幂等→冲突→缺号→更正→处置依赖（建立/幂等/校验/查询）→
-封存被拒→闭合→封存（含依赖快照）→封存后迟到与依赖增删→完成被拒→闭合→完成→
-完成后拒绝语义（含依赖变更）→重复完成幂等。
+冲突裁决（维持/采纳/幂等/修订号防护）→封存被拒→闭合→封存（含依赖快照）→
+封存后迟到与依赖增删→完成被拒→闭合→完成→
+完成后拒绝语义（含依赖变更与首次裁决）→重复完成幂等。
 
 用法：
     python3 examples/demo_api.py
@@ -156,22 +157,77 @@ def main() -> None:
          call("GET", f"/api/drills/{drill_id}/records/T1/3/dependencies"))
     show("当前依赖列表", call("GET", f"/api/drills/{drill_id}/dependencies"))
 
-    # 8. 封存前：缺号未闭合应被拒绝
-    step("8. 未闭合缺号时尝试封存 => 明确错误")
+    # 8. 冲突裁决：演练负责人对第 4 步留存的 T1#2 证据逐条裁决
+    step("8. 冲突裁决：维持 / 采纳 / 幂等 / 修订号防护")
+    conflicts = show("冲突证据列表（每条内联 adjudication 字段）",
+                     call("GET", f"/api/drills/{drill_id}/conflicts"))["conflicts"]
+    t1_conflict_id = next(c["id"] for c in conflicts
+                          if c["terminal_code"] == "T1" and c["seq"] == 2)
+    show("维持现记录（keep）", call(
+        "POST", f"/api/drills/{drill_id}/conflicts/{t1_conflict_id}/adjudications",
+        {"decision": "keep", "reason": "现记录已与堤岸监测点电话核实，维持不变",
+         "operator": "演练负责人"}))
+    show("相同结论和理由重试（幂等，already_adjudicated）", call(
+        "POST", f"/api/drills/{drill_id}/conflicts/{t1_conflict_id}/adjudications",
+        {"decision": "keep", "reason": "现记录已与堤岸监测点电话核实，维持不变",
+         "operator": "演练负责人"}))
+    show("改判 => 409 adjudication_exists", call(
+        "POST", f"/api/drills/{drill_id}/conflicts/{t1_conflict_id}/adjudications",
+        {"decision": "adopt", "reason": "试图改判", "operator": "演练负责人",
+         "seen_rev": 0}))
+
+    # 再制造 T2#2 冲突，演示“采纳”与所见修订号防护
+    show("冲突 T2#2（迟到不同内容）", call(
+        "POST", f"/api/drills/{drill_id}/terminals/T2/reports",
+        {"entries": [
+            {"seq": 2, "occurred_at": "2026-10-05T09:15:00Z",
+             "event_type": "water_level", "content": "水位 21.7m（迟到原文）"},
+        ]}))
+    t2_conflict_id = next(
+        c["id"] for c in call("GET", f"/api/drills/{drill_id}/conflicts")[1]["conflicts"]
+        if c["terminal_code"] == "T2" and c["seq"] == 2)
+    show("期间记录被更正（rev 0 -> 1）", call(
+        "PUT", f"/api/drills/{drill_id}/records/T2/2",
+        {"content": "水位 21.65m（复核值）", "reason": "与相邻断面交叉复核",
+         "revised_by": "值班长"}))
+    show("用过期的所见修订号采纳 => 409 revision_mismatch（不落裁决）", call(
+        "POST", f"/api/drills/{drill_id}/conflicts/{t2_conflict_id}/adjudications",
+        {"decision": "adopt", "reason": "采纳迟到原文", "operator": "演练负责人",
+         "seen_rev": 0}))
+    cur_rev = call("GET", f"/api/drills/{drill_id}/records/T2/2")[1]["rev"]
+    show(f"以当前修订号 seen_rev={cur_rev} 重新采纳 => 迟到原文写为下一修订", call(
+        "POST", f"/api/drills/{drill_id}/conflicts/{t2_conflict_id}/adjudications",
+        {"decision": "adopt", "reason": "迟到原文为监测点原始读数，予以采纳",
+         "operator": "演练负责人", "seen_rev": cur_rev}))
+    show("记录+全部修订（原文与历史保留）",
+         call("GET", f"/api/drills/{drill_id}/records/T2/2"))
+
+    # 留一份未裁决证据（T1#3），用于完成后“不得首次裁决”的演示
+    t1_late_conflict_id = show("再留一份未裁决证据 T1#3", call(
+        "POST", f"/api/drills/{drill_id}/terminals/T1/reports",
+        {"entries": [
+            {"seq": 3, "occurred_at": "2026-10-05T09:20:00Z",
+             "event_type": "patrol", "content": "第一轮巡查（迟到不同版本，暂不裁决）"},
+        ]}))["results"][0]["conflict_id"]
+    show("按演练查询裁决结果（连同证据）",
+         call("GET", f"/api/drills/{drill_id}/adjudications"))
+
+    # 9. 封存前：缺号未闭合应被拒绝
+    step("9. 未闭合缺号时尝试封存 => 明确错误")
     show("封存被拒", call("POST", f"/api/drills/{drill_id}/seals", {"note": "第一次尝试"}))
 
-    # 9. 闭合缺号：T2#1 确认为丢失
-    step("9. 逐号确认 T2 缺号 1 丢失")
+    # 10. 闭合缺号：T2#1 确认为丢失
+    step("10. 逐号确认 T2 缺号 1 丢失")
     show("确认丢失", call("POST", f"/api/drills/{drill_id}/terminals/T2/gaps/lost",
                           {"seq": 1, "reason": "离线缓存损坏无法恢复",
                            "confirmed_by": "保障组"}))
 
-    # 10. 封存 v1（快照含当时的依赖及依据）
-    step("10. 封存版本 1（不可变快照，含依赖及依据）")
+    # 11. 封存 v1（快照含当时的依赖及依据、采纳产生的修订）
+    step("11. 封存版本 1（不可变快照，含依赖及依据、采纳修订）")
     show("封存", call("POST", f"/api/drills/{drill_id}/seals", {"note": "演练结束封存"}))
 
-    # 11. 封存后的迟到上报与依赖增删：当前视图接纳，封存版不变
-    step("11. 封存后：迟到上报 + 依赖增删（只影响当前视图）")
+    # 12. 封存后的迟到上报与依赖增删：当前视图接纳，封存版不变
+    step("12. 封存后：迟到上报 + 依赖增删（只影响当前视图）")
     show("迟到上报 T3#1", call(
         "POST", f"/api/drills/{drill_id}/terminals/T3/reports",
         {"entries": [
@@ -196,8 +252,8 @@ def main() -> None:
     show("当前依赖列表已更新", call("GET", f"/api/drills/{drill_id}/dependencies"))
     show("当前时间线已含迟到数据", call("GET", f"/api/drills/{drill_id}/timeline"))
 
-    # 12. 非法场景
-    step("12. 错误场景")
+    # 13. 非法场景
+    step("13. 错误场景")
     show("未登记终端上报", call(
         "POST", f"/api/drills/{drill_id}/terminals/GHOST/reports",
         {"entries": [{"seq": 1, "occurred_at": "2026-10-05T09:00:00Z",
@@ -207,8 +263,8 @@ def main() -> None:
         {"entries": [{"seq": -3, "occurred_at": "2026-10-05T09:00:00Z",
                       "event_type": "x", "content": "y"}]}))
 
-    # 13. 主动完成：T3 只报了 1、3（缺 2），缺号未闭合时完成被拒
-    step("13. 主动完成：缺号未闭合 => 409 且不生成封存版本")
+    # 14. 主动完成：T3 只报了 1、3（缺 2），缺号未闭合时完成被拒
+    step("14. 主动完成：缺号未闭合 => 409 且不生成封存版本")
     show("T3 上报 3（缺 2）", call(
         "POST", f"/api/drills/{drill_id}/terminals/T3/reports",
         {"entries": [
@@ -218,8 +274,8 @@ def main() -> None:
     show("完成被拒", call("POST", f"/api/drills/{drill_id}/complete",
                           {"completed_by": "演练负责人"}))
 
-    # 14. 逐号确认 T3 缺号 2 丢失后，完成原子生成最终封存版本并转为已完成
-    step("14. 闭合缺号后完成 => 原子生成最终封存版本（201，含当前依赖）")
+    # 15. 逐号确认 T3 缺号 2 丢失后，完成原子生成最终封存版本并转为已完成
+    step("15. 闭合缺号后完成 => 原子生成最终封存版本（201，含当前依赖）")
     show("确认 T3#2 丢失", call("POST", f"/api/drills/{drill_id}/terminals/T3/gaps/lost",
                                 {"seq": 2, "reason": "终端掉电未缓存",
                                  "confirmed_by": "保障组"}))
@@ -227,8 +283,8 @@ def main() -> None:
                           {"note": "演练正式收官", "completed_by": "张指挥"}))
     show("演练状态（completed）", call("GET", f"/api/drills/{drill_id}"))
 
-    # 15. 完成后：变更类操作一律拒绝；相同内容重试仍 duplicate；冲突不新增证据
-    step("15. 完成后的拒绝语义（含依赖变更）")
+    # 16. 完成后：变更类操作一律拒绝；相同内容重试仍 duplicate；冲突不新增证据
+    step("16. 完成后的拒绝语义（含依赖变更与冲突首次裁决）")
     show("登记终端被拒", call("POST", f"/api/drills/{drill_id}/terminals",
                               {"terminals": [{"code": "T9"}]}))
     show("混合批次：重试=duplicate，新序号/冲突=rejected", call(
@@ -256,9 +312,16 @@ def main() -> None:
         "DELETE", f"/api/drills/{drill_id}/dependencies",
         {"predecessor": {"terminal_code": "T1", "seq": 1},
          "successor": {"terminal_code": "T1", "seq": 2}}))
+    show("未裁决证据首次裁决被拒（drill_completed）", call(
+        "POST", f"/api/drills/{drill_id}/conflicts/{t1_late_conflict_id}/adjudications",
+        {"decision": "keep", "reason": "完成后才想起裁决", "operator": "演练负责人"}))
+    show("既有裁决的幂等重试仍返回原结果（200）", call(
+        "POST", f"/api/drills/{drill_id}/conflicts/{t1_conflict_id}/adjudications",
+        {"decision": "keep", "reason": "现记录已与堤岸监测点电话核实，维持不变",
+         "operator": "演练负责人"}))
 
-    # 16. 重复完成幂等返回同一最终版本；历史读取（含依赖）仍可用
-    step("16. 重复完成 => 同一最终版本（200）；历史读取仍可用")
+    # 17. 重复完成幂等返回同一最终版本；历史读取（含依赖）仍可用
+    step("17. 重复完成 => 同一最终版本（200）；历史读取仍可用")
     show("重复完成", call("POST", f"/api/drills/{drill_id}/complete",
                           {"note": "再次完成", "completed_by": "别人"}))
     show("封存版本列表（is_final 标记）", call("GET", f"/api/drills/{drill_id}/seals"))

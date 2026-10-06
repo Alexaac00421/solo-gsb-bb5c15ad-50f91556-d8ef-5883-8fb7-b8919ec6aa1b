@@ -182,11 +182,30 @@ SCHEMA_STATEMENTS = [
         PRIMARY KEY (seal_id, pred_terminal_code, pred_seq, succ_terminal_code, succ_seq)
     )
     """,
+    # 冲突裁决：每份冲突证据至多一条裁决（不可改判/改理由）。
+    # seen_rev 为采纳时演练负责人所见的当前修订号；applied_rev 为采纳写出的新修订号
+    # （维持或“迟到原文已与当前一致”时为 NULL，表示未产生新修订）
+    """
+    CREATE TABLE IF NOT EXISTS conflict_adjudications (
+        id          TEXT PRIMARY KEY,
+        conflict_id TEXT NOT NULL REFERENCES conflicts(id),
+        drill_id    TEXT NOT NULL REFERENCES drills(id),
+        record_id   TEXT NOT NULL REFERENCES records(id),
+        decision    TEXT NOT NULL,
+        reason      TEXT NOT NULL,
+        operator    TEXT NOT NULL,
+        seen_rev    INTEGER,
+        applied_rev INTEGER,
+        created_at  TEXT NOT NULL,
+        UNIQUE (conflict_id)
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_records_drill ON records(drill_id)",
     "CREATE INDEX IF NOT EXISTS idx_revisions_record ON record_revisions(record_id)",
     "CREATE INDEX IF NOT EXISTS idx_conflicts_drill ON conflicts(drill_id)",
     "CREATE INDEX IF NOT EXISTS idx_lost_drill ON lost_gaps(drill_id, resolved)",
     "CREATE INDEX IF NOT EXISTS idx_deps_drill ON record_dependencies(drill_id)",
+    "CREATE INDEX IF NOT EXISTS idx_adjudications_drill ON conflict_adjudications(drill_id)",
 ]
 
 

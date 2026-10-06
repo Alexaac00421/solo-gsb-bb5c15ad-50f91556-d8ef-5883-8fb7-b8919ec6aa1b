@@ -80,3 +80,13 @@ class DependencyCreate(BaseModel):
 class DependencyRevoke(BaseModel):
     predecessor: DependencyEndpoint
     successor: DependencyEndpoint
+
+
+class AdjudicationCreate(BaseModel):
+    # 宽松类型：非法值由业务层给出明确错误码
+    # decision 取 keep（维持现记录）/ adopt（采纳迟到原文）；
+    # 采纳时必须提交所见当前修订号 seen_rev
+    decision: Any = None
+    reason: Any = None
+    operator: Any = None
+    seen_rev: Any = None

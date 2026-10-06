@@ -10,6 +10,7 @@ from . import service
 from .db import connect, init_db
 from .errors import APIError
 from .models import (
+    AdjudicationCreate,
     Correction,
     DependencyCreate,
     DependencyRevoke,
@@ -121,6 +122,30 @@ def mark_lost(drill_id: str, terminal_code: str, payload: MarkLost,
 @app.get("/api/drills/{drill_id}/conflicts")
 def conflicts(drill_id: str, conn=Depends(db)) -> dict:
     return service.list_conflicts(conn, drill_id)
+
+
+# ---------------------------------------------------------------- 冲突裁决
+
+@app.post("/api/drills/{drill_id}/conflicts/{conflict_id}/adjudications")
+def adjudicate_conflict(drill_id: str, conflict_id: str, payload: AdjudicationCreate,
+                        response: Response, conn=Depends(db)) -> dict:
+    """裁决冲突证据：维持现记录（keep）或采纳迟到原文（adopt），附非空理由与操作者。
+
+    首次裁决返回 201；相同结论和理由的重复提交幂等返回 200。
+    """
+    body = service.adjudicate_conflict(
+        conn, drill_id, conflict_id, payload.decision, payload.reason,
+        payload.operator, payload.seen_rev,
+    )
+    if not body["already_adjudicated"]:
+        response.status_code = 201
+    return body
+
+
+@app.get("/api/drills/{drill_id}/adjudications")
+def list_adjudications(drill_id: str, conn=Depends(db)) -> dict:
+    """按演练查询裁决结果（连同冲突证据）。"""
+    return service.list_adjudications(conn, drill_id)
 
 
 # ---------------------------------------------------------------- 记录 / 更正

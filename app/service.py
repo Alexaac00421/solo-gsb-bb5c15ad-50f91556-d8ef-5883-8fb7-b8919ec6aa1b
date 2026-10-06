@@ -597,34 +597,250 @@ def get_record(conn: sqlite3.Connection, drill_id: str, terminal_code: str, seq:
     return body
 
 
-# ---------------------------------------------------------------- 冲突证据
+# ---------------------------------------------------------------- 冲突证据与裁决
+
+def _conflict_evidence_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "terminal_code": row["terminal_code"],
+        "record_id": row["record_id"],
+        "seq": row["seq"],
+        "incoming": row["incoming"],
+        "existing": row["existing"],
+        "incoming_fingerprint": row["incoming_fingerprint"],
+        "existing_fingerprint": row["existing_fingerprint"],
+        "created_at": row["created_at"],
+    }
+
 
 def list_conflicts(conn: sqlite3.Connection, drill_id: str) -> dict:
+    """冲突证据列表；每条证据内联其裁决结果（未裁决为 None）。"""
     with transaction(conn, immediate=False):
         _require_drill(conn, drill_id)
         rows = conn.execute(
-            "SELECT c.*, t.code AS terminal_code FROM conflicts c "
+            "SELECT c.*, t.code AS terminal_code, "
+            "a.id AS adj_id, a.decision AS adj_decision, a.reason AS adj_reason, "
+            "a.operator AS adj_operator, a.seen_rev AS adj_seen_rev, "
+            "a.applied_rev AS adj_applied_rev, a.created_at AS adj_created_at "
+            "FROM conflicts c "
             "JOIN terminals t ON t.id = c.terminal_id "
+            "LEFT JOIN conflict_adjudications a ON a.conflict_id = c.id "
             "WHERE c.drill_id = ? ORDER BY c.created_at, t.code, c.seq",
             (drill_id,),
         ).fetchall()
+    conflicts = []
+    for r in rows:
+        item = _conflict_evidence_dict(r)
+        if r["adj_id"] is None:
+            item["adjudication"] = None
+        else:
+            item["adjudication"] = {
+                "id": r["adj_id"],
+                "decision": r["adj_decision"],
+                "reason": r["adj_reason"],
+                "operator": r["adj_operator"],
+                "seen_rev": r["adj_seen_rev"],
+                "applied_rev": r["adj_applied_rev"],
+                "revision_created": r["adj_applied_rev"] is not None,
+                "created_at": r["adj_created_at"],
+            }
+        conflicts.append(item)
+    return {"drill_id": drill_id, "conflicts": conflicts}
+
+
+# 裁决查询：连同证据一起取出（终端标识、序号、双方原文与指纹）
+_ADJUDICATION_SELECT = (
+    "SELECT a.*, t.code AS terminal_code, c.seq AS seq, "
+    "c.incoming AS incoming, c.existing AS existing, "
+    "c.incoming_fingerprint AS incoming_fingerprint, "
+    "c.existing_fingerprint AS existing_fingerprint, "
+    "c.created_at AS conflict_created_at "
+    "FROM conflict_adjudications a "
+    "JOIN conflicts c ON c.id = a.conflict_id "
+    "JOIN terminals t ON t.id = c.terminal_id "
+)
+
+
+def _adjudication_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "conflict_id": row["conflict_id"],
+        "record_id": row["record_id"],
+        "terminal_code": row["terminal_code"],
+        "seq": row["seq"],
+        "decision": row["decision"],
+        "reason": row["reason"],
+        "operator": row["operator"],
+        "seen_rev": row["seen_rev"],
+        "applied_rev": row["applied_rev"],
+        "revision_created": row["applied_rev"] is not None,
+        "created_at": row["created_at"],
+    }
+
+
+def adjudicate_conflict(conn: sqlite3.Connection, drill_id: str, conflict_id: str,
+                        decision: Any, reason: Any, operator: Any, seen_rev: Any) -> dict:
+    """对一份冲突证据作出裁决：维持现记录（keep）或采纳迟到原文（adopt）。
+
+    - 裁决必须附非空理由与操作者；每份证据至多一条裁决；
+    - 同一证据以相同结论和理由重试幂等返回原结果；改判或改理由返回 409；
+    - 采纳须提交所见当前修订号 seen_rev：与记录当前修订号不一致（期间被更正）
+      时返回 409 revision_mismatch 且不落裁决，不能用证据里的旧内容覆盖新版本；
+    - 采纳成功把证据所存迟到原文写为下一修订（与裁决同事务原子生效，原文与
+      历史修订全部保留）；迟到原文已与当前内容一致时只记裁决、不产生空修订；
+    - 已完成的演练不得首次裁决（既有裁决的幂等重试仍返回原结果）。
+    """
+    if not isinstance(decision, str) or decision.strip() not in ("keep", "adopt"):
+        raise APIError(
+            "decision 必须是 keep（维持现记录）或 adopt（采纳迟到原文）",
+            code="invalid_decision",
+        )
+    decision = decision.strip()
+    if not isinstance(reason, str) or not reason.strip():
+        raise APIError("裁决理由 reason 必须是非空字符串", code="invalid_reason")
+    reason = reason.strip()
+    if not isinstance(operator, str) or not operator.strip():
+        raise APIError("操作者 operator 必须是非空字符串", code="invalid_operator")
+    operator = operator.strip()
+
+    with transaction(conn):
+        drill = _require_drill(conn, drill_id)
+        conflict = conn.execute(
+            "SELECT c.*, t.code AS terminal_code FROM conflicts c "
+            "JOIN terminals t ON t.id = c.terminal_id "
+            "WHERE c.id = ? AND c.drill_id = ?",
+            (conflict_id, drill_id),
+        ).fetchone()
+        if conflict is None:
+            raise NotFoundError(
+                f"演练 {drill_id} 不存在冲突证据 {conflict_id}（仅限裁决本演练的证据）",
+                code="conflict_not_found",
+            )
+
+        existing = conn.execute(
+            _ADJUDICATION_SELECT + "WHERE a.conflict_id = ?", (conflict_id,)
+        ).fetchone()
+        if existing is not None:
+            if existing["decision"] == decision and existing["reason"] == reason:
+                # 幂等：相同结论和理由的重试返回原结果（演练完成后亦然）
+                return {
+                    "drill_id": drill_id,
+                    "already_adjudicated": True,
+                    "adjudication": _adjudication_dict(existing),
+                }
+            raise ConflictError(
+                "该冲突证据已存在不同结论或理由的裁决，裁决不可改判或更改理由",
+                code="adjudication_exists",
+                details={"adjudication": _adjudication_dict(existing)},
+            )
+
+        # 首次裁决：演练完成后不得再发生
+        if drill["status"] == "completed":
+            raise ConflictError(
+                f"演练 {drill_id} 已完成（最终封存版本 "
+                f"v{drill['final_seal_version']}），冲突证据不得首次裁决",
+                code="drill_completed",
+                details={
+                    "status": "completed",
+                    "final_seal_version": drill["final_seal_version"],
+                    "completed_at": drill["completed_at"],
+                },
+            )
+
+        record = conn.execute(
+            "SELECT * FROM records WHERE id = ?", (conflict["record_id"],)
+        ).fetchone()
+        if record is None:
+            raise NotFoundError(
+                "冲突证据对应的记录不存在，无法裁决", code="record_not_found"
+            )
+
+        seen_rev_value = None
+        applied_rev = None
+        if decision == "adopt":
+            if not isinstance(seen_rev, int) or isinstance(seen_rev, bool) or seen_rev < 0:
+                raise APIError(
+                    "采纳迟到原文必须提交所见当前修订号 seen_rev（>= 0 的整数）",
+                    code="invalid_seen_rev",
+                )
+            if seen_rev != record["rev"]:
+                raise ConflictError(
+                    f"记录当前修订号为 {record['rev']}，与提交的所见修订号 {seen_rev} "
+                    "不一致：期间记录已被更正，本次裁决未生效；不能用证据里的旧内容"
+                    "覆盖新版本，请基于最新记录重新裁决",
+                    code="revision_mismatch",
+                    details={
+                        "record_id": record["id"],
+                        "current_rev": record["rev"],
+                        "seen_rev": seen_rev,
+                    },
+                )
+            seen_rev_value = seen_rev
+            import json
+            incoming = json.loads(conflict["incoming"])
+            fingerprint = compute_fingerprint(
+                incoming["occurred_at"], incoming["event_type"], incoming["content"]
+            )
+            if fingerprint != record["fingerprint"]:
+                # 采纳：把证据所存迟到原文写为下一修订，原文与历史修订全部保留
+                applied_rev = record["rev"] + 1
+                ts = now_iso()
+                conn.execute(
+                    "INSERT INTO record_revisions (id, record_id, drill_id, rev, occurred_at, "
+                    "event_type, content, fingerprint, reason, revised_by, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (_new_id("rev"), record["id"], drill_id, applied_rev,
+                     incoming["occurred_at"], incoming["event_type"], incoming["content"],
+                     fingerprint, reason, operator, ts),
+                )
+                conn.execute(
+                    "UPDATE records SET occurred_at = ?, event_type = ?, content = ?, "
+                    "fingerprint = ?, rev = ?, updated_at = ? WHERE id = ?",
+                    (incoming["occurred_at"], incoming["event_type"], incoming["content"],
+                     fingerprint, applied_rev, ts, record["id"]),
+                )
+            # 迟到原文已与当前内容一致：只记裁决，不产生空修订
+
+        adj_id = _new_id("adj")
+        conn.execute(
+            "INSERT INTO conflict_adjudications (id, conflict_id, drill_id, record_id, "
+            "decision, reason, operator, seen_rev, applied_rev, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (adj_id, conflict_id, drill_id, record["id"], decision, reason, operator,
+             seen_rev_value, applied_rev, now_iso()),
+        )
+        row = conn.execute(
+            _ADJUDICATION_SELECT + "WHERE a.id = ?", (adj_id,)
+        ).fetchone()
+
     return {
         "drill_id": drill_id,
-        "conflicts": [
-            {
-                "id": r["id"],
-                "terminal_code": r["terminal_code"],
-                "record_id": r["record_id"],
-                "seq": r["seq"],
-                "incoming": r["incoming"],
-                "existing": r["existing"],
-                "incoming_fingerprint": r["incoming_fingerprint"],
-                "existing_fingerprint": r["existing_fingerprint"],
-                "created_at": r["created_at"],
-            }
-            for r in rows
-        ],
+        "already_adjudicated": False,
+        "adjudication": _adjudication_dict(row),
     }
+
+
+def list_adjudications(conn: sqlite3.Connection, drill_id: str) -> dict:
+    """按演练查询裁决结果，每条裁决连同其冲突证据一起返回。"""
+    with transaction(conn, immediate=False):
+        _require_drill(conn, drill_id)
+        rows = conn.execute(
+            _ADJUDICATION_SELECT + "WHERE a.drill_id = ? ORDER BY a.created_at, t.code, c.seq",
+            (drill_id,),
+        ).fetchall()
+    adjudications = []
+    for r in rows:
+        item = _adjudication_dict(r)
+        item["conflict"] = {
+            "id": r["conflict_id"],
+            "incoming": r["incoming"],
+            "existing": r["existing"],
+            "incoming_fingerprint": r["incoming_fingerprint"],
+            "existing_fingerprint": r["existing_fingerprint"],
+            "created_at": r["conflict_created_at"],
+        }
+        adjudications.append(item)
+    return {"drill_id": drill_id, "adjudications": adjudications}
 
 
 # ---------------------------------------------------------------- 处置依赖
